@@ -102,7 +102,7 @@ ModbusMessage FC16(ModbusMessage request) {
     request.get(6, bytes);   // read # of data bytes from request (seems redundant with # of words)
     char debugString[1000];
 
-    printf("FC16 received: write %d words @ %d\r\n", words, addr);
+    // printf("FC16 received: write %d words @ %d\r\n", words, addr);
 
     // # of registers proper?
     if ((bytes != (words * 2))  // byte count in request must match # of words in request
@@ -121,37 +121,36 @@ ModbusMessage FC16(ModbusMessage request) {
     }
 
     // Do the writes
-    sprintf(debugString, "Write : ");
+    // sprintf(debugString, "Write : ");
     for (uint8_t i = 0; i < words; ++i) {
         request.get(7 + (i * 2), val);  // data starts at byte 6 in request packet
         mbPV[addr + i] = val;
-        sprintf(debugString + strlen(debugString), "%i ", mbPV[addr + i]);
+        // sprintf(debugString + strlen(debugString), "%i ", mbPV[addr + i]);
     }
-    printf("%s\r\n", debugString);
+    // printf("%s\r\n", debugString);
+
+    uint16_t config = mbPV[addr + 0];
 
     uint8_t txItem[] = {
-        (uint8_t)(rx_frame.FIR.B.DLC | (rx_frame.FIR.B.FF ? 0x20 : 0x00)),  // DLC & 0x20 for extended
-        (uint8_t)((rx_frame.MsgID >> 24) & 0xFF),                           // ADDR 0
-        (uint8_t)((rx_frame.MsgID >> 16) & 0xFF),                           // ADDR 1
-        (uint8_t)((rx_frame.MsgID >> 8) & 0xFF),                            // ADDR 2
-        (uint8_t)(rx_frame.MsgID & 0xFF),                                   // ADDR 3
-        rx_frame.data.u8[0],
-        rx_frame.data.u8[1],
-        rx_frame.data.u8[2],
-        rx_frame.data.u8[3],
-        rx_frame.data.u8[4],
-        rx_frame.data.u8[5],
-        rx_frame.data.u8[6],
-        rx_frame.data.u8[7],
-        (uint8_t)((time >> 24) & 0xFF),
-        (uint8_t)((time >> 16) & 0xFF),
-        (uint8_t)((time >> 8) & 0xFF),
-        (uint8_t)(time & 0xFF),
+        (uint8_t)(config & 0x20 == 0x20),         // extended
+        (uint8_t)((mbPV[addr + 1] >> 8) & 0xFF),  // ADDR 0
+        (uint8_t)(mbPV[addr + 1] & 0xFF),         // ADDR 0
+        (uint8_t)((mbPV[addr + 2] >> 8) & 0xFF),  // ADDR 1
+        (uint8_t)(mbPV[addr + 2] & 0xFF),         // ADDR 1
+        (uint8_t)(config & 0x0F),                 // DLC
+        (uint8_t)(mbPV[addr + 3] >> 8),
+        (uint8_t)(mbPV[addr + 3] & 0xFF),
+        (uint8_t)(mbPV[addr + 4] >> 8),
+        (uint8_t)(mbPV[addr + 4] & 0xFF),
+        (uint8_t)(mbPV[addr + 5] >> 8),
+        (uint8_t)(mbPV[addr + 5] & 0xFF),
+        (uint8_t)(mbPV[addr + 6] >> 8),
+        (uint8_t)(mbPV[addr + 6] & 0xFF),
     };
 
-    UBaseType_t res = xRingbufferSend(bufHandle, txItem, sizeof(txItem), pdMS_TO_TICKS(1000));
+    UBaseType_t res = xRingbufferSend(writeBufHandle, txItem, sizeof(txItem), pdMS_TO_TICKS(1000));
     if (res != pdTRUE) {
-        printf("Send Item Failed\r\n");
+        printf("Send Write Item Failed\r\n");
     }
 
     // Set up response
@@ -201,10 +200,16 @@ void setup() {
     xTaskCreate(
         taskTwo, "TaskTwo", 10000, NULL, 1, NULL);
     xTaskCreate(
-        taskThree, "TaskThree", 1000, NULL, 1, NULL);
+        taskThree, "TaskThree", 10000, NULL, 1, NULL);
 }
 
 void loop() {
+    heartbeat++;
+    if (heartbeat > 15) {
+        heartbeat = 0;
+    }
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    vTaskDelay(500);
 }
 
 void taskOne(void *parameter) {
@@ -249,7 +254,7 @@ void taskOne(void *parameter) {
 }
 
 void taskTwo(void *parameter) {
-    bufHandle = xRingbufferCreate(1028, RINGBUF_TYPE_NOSPLIT);
+    bufHandle = xRingbufferCreate(1024, RINGBUF_TYPE_NOSPLIT);
     if (bufHandle == NULL) {
         printf("Create RingBuffer Failed");
     }
@@ -299,19 +304,40 @@ void taskTwo(void *parameter) {
             // }
             // printf("\n---- \n");
             vRingbufferReturnItem(bufHandle, (void *)item);
-        } else {
-            printf("Receive none\n");
+            // } else {
+            //     printf("Receive none\n");
         }
     }
     vTaskDelete(NULL);
 }
+
 void taskThree(void *parameter) {
-    while (1) {
-        heartbeat++;
-        if (heartbeat > 15) {
-            heartbeat = 0;
-        }
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-        vTaskDelay(500);
+    writeBufHandle = xRingbufferCreate(1024, RINGBUF_TYPE_NOSPLIT);
+    if (writeBufHandle == NULL) {
+        printf("Create Write RingBuffer Failed");
     }
+    while (1) {
+        size_t itemSize;
+        // printf("\r\n=%p\r\n", writeBufHandle);
+        char *item = (char *)xRingbufferReceive(writeBufHandle, &itemSize, pdMS_TO_TICKS(1000));
+        if (item != NULL) {
+            // for (int i = 0; i < itemSize; i++) {
+            //     printf("%02X ", item[i]);
+            // }
+            // printf("\n");
+            CAN_frame_t tx_frame;
+            tx_frame.FIR.B.FF = (item[0] == 0) ? CAN_frame_ext : CAN_frame_std;
+            tx_frame.MsgID = item[1] << 24 | item[2] << 16 | item[3] << 8 | item[4];
+            tx_frame.FIR.B.DLC = item[5];
+            for (int i = 0; i < 8; i++) {
+                tx_frame.data.u8[i] = item[6 + i];
+            }
+            // printf("%04X \n", tx_frame.MsgID);
+            ESP32Can.CANWriteFrame(&tx_frame);
+            vRingbufferReturnItem(writeBufHandle, (void *)item);
+            // } else {
+            // printf("Receive Write Buffer None\n");
+        }
+    }
+    vTaskDelete(NULL);
 }
