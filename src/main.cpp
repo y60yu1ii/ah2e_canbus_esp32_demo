@@ -11,7 +11,7 @@
 #include "freertos/timers.h"
 
 #define LED_PIN 2
-#define OBJ_LEN 15
+#define OBJ_LEN 17
 #define BUF_COUNT 200
 #define OBS_COUNT 5
 
@@ -67,13 +67,18 @@ FC0304(ModbusMessage request) {
             }
         }
         if (request.getFunctionCode() == READ_INPUT_REGISTER) {
-            for (uint8_t i = 0; i < words; ++i) {
-                response.add((uint16_t)canbusData[getHead * 15 + i]);
+            response.add((uint16_t)canbusData[getHead * OBJ_LEN]);
+            // printf("[%d] %04X \n", getHead * OBJ_LEN, canbusData[getHead * OBJ_LEN]);
+            for (uint8_t i = 0; i < words - 1; ++i) {
+                response.add((uint16_t)((canbusData[getHead * OBJ_LEN + 2 * i + 1] << 8) | canbusData[getHead * OBJ_LEN + 2 * (i + 1)]));
+                // printf("[%d] %04X \n", getHead * OBJ_LEN + 2 * i + 1, (canbusData[getHead * OBJ_LEN + 2 * i + 1] << 8) | canbusData[getHead * OBJ_LEN + 2 * (i + 1)]);
             }
             getHead++;
             if (getHead >= head) {
                 getHead = 0;
             }
+            // printf("h %d\n", getHead);
+            // printf("=== \n");
         }
     }
     // Send response back
@@ -139,7 +144,7 @@ void taskOne(void *parameter) {
 
     while (1) {
         if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
-            uint16_t time = (esp_timer_get_time() / 1000) & 0xFFFF;
+            uint32_t time = esp_timer_get_time();
             uint8_t txItem[] = {
                 (uint8_t)(rx_frame.FIR.B.DLC | (rx_frame.FIR.B.FF ? 0x20 : 0x00)),  // DLC & 0x20 for extended
                 (uint8_t)((rx_frame.MsgID >> 24) & 0xFF),                           // ADDR 0
@@ -154,6 +159,8 @@ void taskOne(void *parameter) {
                 rx_frame.data.u8[5],
                 rx_frame.data.u8[6],
                 rx_frame.data.u8[7],
+                (uint8_t)((time >> 24) & 0xFF),
+                (uint8_t)((time >> 16) & 0xFF),
                 (uint8_t)((time >> 8) & 0xFF),
                 (uint8_t)(time & 0xFF),
             };
