@@ -10,10 +10,12 @@
 #include "freertos/ringbuf.h"
 #include "freertos/timers.h"
 
+#define MBTCP_ID 1
 #define LED_PIN 2
 #define OBJ_LEN 17
 #define BUF_COUNT 200
 #define OBS_COUNT 5
+#define MBPV_MAX 128
 
 char mdns[32] = "ah2e";
 char password[64] = "123456789";
@@ -38,9 +40,10 @@ uint8_t canbusData[OBJ_LEN * BUF_COUNT];
 
 u_int16_t getHead = 0;
 u_int16_t head = 0;  // head for canbus data buffer
+uint16_t mbPV[MBPV_MAX];
 // Server function to handle FC 0x03 and 0x04
-ModbusMessage
-FC0304(ModbusMessage request) {
+// https :  // github.com/eModbus/eModbus/discussions/147
+ModbusMessage FC0304(ModbusMessage request) {
     ModbusMessage response;  // The Modbus message we are going to give back
     uint16_t addr = 0;       // Start address
     uint16_t words = 0;      // # of words requested
@@ -85,6 +88,51 @@ FC0304(ModbusMessage request) {
     return response;
 }
 
+// Server function to handle FC 0x10 (FC16)
+ModbusMessage FC16(ModbusMessage request) {
+    // Serial.println(request);
+    ModbusMessage response;  // The Modbus message we are going to give back
+    uint16_t addr = 0;       // Start address
+    uint16_t words = 0;      // total words to write
+    uint8_t bytes = 0;       // # of data bytes in request
+    uint16_t val = 0;        // value to be written
+    request.get(2, addr);    // read address from request
+    request.get(4, words);   // read # of words from request
+    request.get(6, bytes);   // read # of data bytes from request (seems redundant with # of words)
+    char debugString[1000];
+
+    printf("FC16 received: write %d words @ %d\r\n", words, addr);
+
+    // # of registers proper?
+    if ((bytes != (words * 2))  // byte count in request must match # of words in request
+        || (words > 123))       // can't support more than this in request packet
+    {                           // Yes - send respective error response
+        response.setError(request.getServerID(), request.getFunctionCode(), ILLEGAL_DATA_VALUE);
+        printf("ERROR - ILLEGAL DATA VALUE\r\n");
+        return response;
+    }
+    // Address overflow?
+    if ((addr + words) > MBPV_MAX) {
+        // Yes - send respective error response
+        response.setError(request.getServerID(), request.getFunctionCode(), ILLEGAL_DATA_ADDRESS);
+        printf("ERROR - ILLEGAL DATA ADDRESS\r\n");
+        return response;
+    }
+
+    // Do the writes
+    sprintf(debugString, "Write : ");
+    for (uint8_t i = 0; i < words; ++i) {
+        request.get(7 + (i * 2), val);  // data starts at byte 6 in request packet
+        mbPV[addr + i] = val;
+        sprintf(debugString + strlen(debugString), "%i ", mbPV[addr + i]);
+    }
+    printf("%s\r\n", debugString);
+
+    // Set up response
+    response.add(request.getServerID(), request.getFunctionCode(), addr, words);
+    return response;
+}
+
 void setup() {
     Serial.begin(115200);
     while (!Serial)
@@ -116,17 +164,18 @@ void setup() {
     }
 
     // Set up TCP server to react on FCs 0x03 and 0x04
-    MBserver.registerWorker(1, READ_HOLD_REGISTER, &FC0304);
-    MBserver.registerWorker(1, READ_INPUT_REGISTER, &FC0304);
+    MBserver.registerWorker(MBTCP_ID, READ_HOLD_REGISTER, &FC0304);
+    MBserver.registerWorker(MBTCP_ID, READ_INPUT_REGISTER, &FC0304);
+    MBserver.registerWorker(MBTCP_ID, WRITE_MULT_REGISTERS, &FC16);
     // Start server
-    MBserver.start(port, 2, 2000);
+    MBserver.start(port, 4, 2000);
 
     xTaskCreate(
         taskOne, "TaskOne", 10000, NULL, 1, NULL);
     xTaskCreate(
         taskTwo, "TaskTwo", 10000, NULL, 1, NULL);
     xTaskCreate(
-        taskThree, "TaskThree", 10000, NULL, 1, NULL);
+        taskThree, "TaskThree", 1000, NULL, 1, NULL);
 }
 
 void loop() {
