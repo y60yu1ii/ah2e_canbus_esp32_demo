@@ -36,6 +36,7 @@ void taskTwo(void *parameter);
 void taskThree(void *parameter);
 
 RingbufHandle_t bufHandle;
+RingbufHandle_t writeBufHandle;
 uint8_t canbusData[OBJ_LEN * BUF_COUNT];
 
 u_int16_t getHead = 0;
@@ -127,6 +128,31 @@ ModbusMessage FC16(ModbusMessage request) {
         sprintf(debugString + strlen(debugString), "%i ", mbPV[addr + i]);
     }
     printf("%s\r\n", debugString);
+
+    uint8_t txItem[] = {
+        (uint8_t)(rx_frame.FIR.B.DLC | (rx_frame.FIR.B.FF ? 0x20 : 0x00)),  // DLC & 0x20 for extended
+        (uint8_t)((rx_frame.MsgID >> 24) & 0xFF),                           // ADDR 0
+        (uint8_t)((rx_frame.MsgID >> 16) & 0xFF),                           // ADDR 1
+        (uint8_t)((rx_frame.MsgID >> 8) & 0xFF),                            // ADDR 2
+        (uint8_t)(rx_frame.MsgID & 0xFF),                                   // ADDR 3
+        rx_frame.data.u8[0],
+        rx_frame.data.u8[1],
+        rx_frame.data.u8[2],
+        rx_frame.data.u8[3],
+        rx_frame.data.u8[4],
+        rx_frame.data.u8[5],
+        rx_frame.data.u8[6],
+        rx_frame.data.u8[7],
+        (uint8_t)((time >> 24) & 0xFF),
+        (uint8_t)((time >> 16) & 0xFF),
+        (uint8_t)((time >> 8) & 0xFF),
+        (uint8_t)(time & 0xFF),
+    };
+
+    UBaseType_t res = xRingbufferSend(bufHandle, txItem, sizeof(txItem), pdMS_TO_TICKS(1000));
+    if (res != pdTRUE) {
+        printf("Send Item Failed\r\n");
+    }
 
     // Set up response
     response.add(request.getServerID(), request.getFunctionCode(), addr, words);
