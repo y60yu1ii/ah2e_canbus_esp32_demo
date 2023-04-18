@@ -7,8 +7,14 @@
 #include <stdlib.h>
 
 #include "ModbusServerWiFi.h"
+#include "freertos/ringbuf.h"
+#include "freertos/timers.h"
 
 #define LED_PIN 2
+#define OBJ_LEN 15
+#define BUF_COUNT 200
+#define OBS_COUNT 5
+
 char mdns[32] = "ah2e";
 char password[64] = "123456789";
 WiFiManager wm;
@@ -20,9 +26,6 @@ CAN_device_t CAN_cfg;          // CAN Config
 const int interval = 500;      // interval at which send CAN Messages (milliseconds)
 const int rx_queue_size = 10;  // Receive Queue size
 
-uint8_t table[128];
-int idTable[] = {0x1, 0x2, 0x3, 0x4};
-
 CAN_frame_t rx_frame;
 
 int heartbeat = 0;
@@ -30,17 +33,14 @@ void taskOne(void *parameter);
 void taskTwo(void *parameter);
 void taskThree(void *parameter);
 
-int cmp(const void *lhs, const void *rhs) {
-    if (*(const int *)lhs < *(const int *)rhs)
-        return -1;
-    else if (*(const int *)rhs < *(const int *)lhs)
-        return 1;
-    else
-        return 0;
-}
+RingbufHandle_t bufHandle;
+uint8_t canbusData[OBJ_LEN * BUF_COUNT];
 
+u_int16_t getHead = 0;
+u_int16_t head = 0;  // head for canbus data buffer
 // Server function to handle FC 0x03 and 0x04
-ModbusMessage FC0304(ModbusMessage request) {
+ModbusMessage
+FC0304(ModbusMessage request) {
     ModbusMessage response;  // The Modbus message we are going to give back
     uint16_t addr = 0;       // Start address
     uint16_t words = 0;      // # of words requested
@@ -67,15 +67,12 @@ ModbusMessage FC0304(ModbusMessage request) {
             }
         }
         if (request.getFunctionCode() == READ_INPUT_REGISTER) {
-            // No, this is for FC 0x04. Response is random
             for (uint8_t i = 0; i < words; ++i) {
-                // send increasing data values
-                // response.add((uint16_t)random(1, 65535));
-                if (i == 0) {
-                    response.add((uint16_t)(heartbeat + 1));
-                } else {
-                    response.add((uint16_t)random(1, 10));
-                }
+                response.add((uint16_t)canbusData[getHead * 15 + i]);
+            }
+            getHead++;
+            if (getHead >= head) {
+                getHead = 0;
             }
         }
     }
@@ -142,36 +139,89 @@ void taskOne(void *parameter) {
 
     while (1) {
         if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
-            if (rx_frame.FIR.B.FF == CAN_frame_std) {
-                printf("New standard frame");
-            } else {
-                printf("New extended frame");
-            }
+            uint16_t time = (esp_timer_get_time() / 1000) & 0xFFFF;
+            uint8_t txItem[] = {
+                (uint8_t)(rx_frame.FIR.B.DLC | (rx_frame.FIR.B.FF ? 0x20 : 0x00)),  // DLC & 0x20 for extended
+                (uint8_t)((rx_frame.MsgID >> 24) & 0xFF),                           // ADDR 0
+                (uint8_t)((rx_frame.MsgID >> 16) & 0xFF),                           // ADDR 1
+                (uint8_t)((rx_frame.MsgID >> 8) & 0xFF),                            // ADDR 2
+                (uint8_t)(rx_frame.MsgID & 0xFF),                                   // ADDR 3
+                rx_frame.data.u8[0],
+                rx_frame.data.u8[1],
+                rx_frame.data.u8[2],
+                rx_frame.data.u8[3],
+                rx_frame.data.u8[4],
+                rx_frame.data.u8[5],
+                rx_frame.data.u8[6],
+                rx_frame.data.u8[7],
+                (uint8_t)((time >> 8) & 0xFF),
+                (uint8_t)(time & 0xFF),
+            };
 
-            if (rx_frame.FIR.B.RTR == CAN_RTR) {
-                printf(" RTR from 0x%08X, DLC %d\r\n", rx_frame.MsgID, rx_frame.FIR.B.DLC);
-            } else {
-                printf(" from 0x%08X, DLC %d, Data ", rx_frame.MsgID, rx_frame.FIR.B.DLC);
-                for (int i = 0; i < rx_frame.FIR.B.DLC; i++) {
-                    printf("0x%02X ", rx_frame.data.u8[i]);
-                }
-                printf("\n");
+            UBaseType_t res = xRingbufferSend(bufHandle, txItem, sizeof(txItem), pdMS_TO_TICKS(1000));
+            if (res != pdTRUE) {
+                printf("Send Item Failed\r\n");
             }
-            // // TODO
-            // if (rx_frame.FIR.B.RTR == CAN_no_RTR) {
-            //     int *p = (int *)bsearch(&rx_frame.MsgID, idTable, 3, sizeof(int), cmp);
-            //     printf(" from 0x%08X, DLC %d, Data ", rx_frame.MsgID, rx_frame.FIR.B.DLC);
-            //     printf("\n");
-            // }
         }
     }
 }
-void taskTwo(void *parameter) {
-    while (1) {
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
 
-        vTaskDelay(500);
+void taskTwo(void *parameter) {
+    bufHandle = xRingbufferCreate(1028, RINGBUF_TYPE_NOSPLIT);
+    if (bufHandle == NULL) {
+        printf("Create RingBuffer Failed");
     }
+    // printf("\r\n===0x%p\r\n", bufHandle);
+    while (1) {
+        size_t itemSize;
+        // printf("\r\n=%p\r\n", bufHandle);
+        char *item = (char *)xRingbufferReceive(bufHandle, &itemSize, pdMS_TO_TICKS(1000));
+        int check = 0;
+        int pos = -1;
+        if (item != NULL) {
+            for (int i = 0; i < head + 1; i++) {
+                pos = i;
+                for (int j = 0; j < 5; j++) {  // 0, 1, 2, 3, 4,
+                    // printf("%d %d\n", canbusData[itemSize * i + j], item[j]);
+                    if (canbusData[itemSize * i + j] != item[j]) {
+                        break;
+                    }
+                    check = j;
+                }
+                if (check == 4 && pos != -1) {  // address matches
+                    // printf(" check is %d pos is %d\n", check, pos);
+                    for (int x = 0; x < itemSize; x++) {
+                        canbusData[pos * itemSize + x] = item[x];
+                    }
+                    break;
+                }
+            }
+            if (check != 4) {
+                // printf(" pos not found %d %d %d\n", pos, head, check);
+                for (int i = 0; i < itemSize; i++) {
+                    canbusData[head * itemSize + i] = item[i];
+                }
+                if (head < BUF_COUNT) {
+                    head++;
+                }
+            }
+            // for (int i = 0; i < itemSize; i++) {
+            //     printf("%02X ", item[i]);
+            // }
+            // printf("\n");
+            // for (int i = 0; i < itemSize * OBS_COUNT; i++) {
+            //     if ((i % 15) == 0 && i > 1) {
+            //         printf("\n");
+            //     }
+            //     printf("%02X ", canbusData[i]);
+            // }
+            // printf("\n---- \n");
+            vRingbufferReturnItem(bufHandle, (void *)item);
+        } else {
+            printf("Receive none\n");
+        }
+    }
+    vTaskDelete(NULL);
 }
 void taskThree(void *parameter) {
     while (1) {
@@ -179,22 +229,7 @@ void taskThree(void *parameter) {
         if (heartbeat > 15) {
             heartbeat = 0;
         }
-        // CAN_frame_t tx_frame;
-        // tx_frame.FIR.B.FF = CAN_frame_ext;
-        // tx_frame.MsgID = 0x2;
-        // tx_frame.FIR.B.DLC = 8;
-        // tx_frame.data.u8[0] = heartbeat;
-        // tx_frame.data.u8[1] = 0x01;
-        // tx_frame.data.u8[2] = 0x02;
-        // tx_frame.data.u8[3] = 0x03;
-        // tx_frame.data.u8[4] = 0x04;
-        // tx_frame.data.u8[5] = 0x05;
-        // tx_frame.data.u8[6] = 0x06;
-        // tx_frame.data.u8[7] = 0x07;
-        // ESP32Can.CANWriteFrame(&tx_frame);
-
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-
         vTaskDelay(500);
     }
 }
